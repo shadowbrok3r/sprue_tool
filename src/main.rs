@@ -35,10 +35,12 @@ pub async fn run() {
     );
     let mut control = OrbitControl::new(camera.target(), 0.1 * scene_radius, 1000.0 * scene_radius);
 
-    let (initial_model, min_y) = load_model(&context, "assets/suzanne.obj").await;
+    let (initial_model, initial_cpu_mesh, min_y) = load_model(&context, "assets/suzanne.obj").await;
     let mut jewelry_model = JewelryModel {
         base: initial_model,
+        base_cpu_mesh: initial_cpu_mesh,
         sprue: None,
+        sprue_cpu_mesh: None,
         selected: None,
     };
 
@@ -47,7 +49,7 @@ pub async fn run() {
 
     let mut file_path: Option<String> = None;
     let mut generate_sprue = false;
-    let mut pending_model: Option<(Gm<Mesh, PhysicalMaterial>, f32)> = None;
+    let mut pending_model: Option<(Gm<Mesh, PhysicalMaterial>, CpuMesh, f32)> = None;
     let mut attachment_y = min_y;
 
     let mut sprue_radius = 0.1;
@@ -61,72 +63,16 @@ pub async fn run() {
     let mut gizmo_transform = Transform::from_scale_rotation_translation(
         DVec3::ONE,
         DQuat::IDENTITY,
-        DVec3::new(sprue_offset.x as f64, (attachment_y + sprue_offset.y) as f64, sprue_offset.z as f64).into(),
+        DVec3::new(sprue_offset.x as f64, (attachment_y + sprue_offset.y) as f64, sprue_offset.z as f64),
     );
 
     window.render_loop(move |mut frame_input| {
-        let mut redraw = frame_input.first_frame;
-        redraw |= camera.set_viewport(frame_input.viewport);
+        let redraw = true; // Always redraw for UI responsiveness
+
+        camera.set_viewport(frame_input.viewport);
 
         let mut egui_consumes_input = false;
         let mut gizmo_interacted = false;
-
-        // Simplified picking
-        for event in &frame_input.events {
-            if let Event::MousePress { button, position, .. } = event {
-                if *button == MouseButton::Left && !egui_consumes_input {
-                    let objects: Vec<Gm<Mesh, PhysicalMaterial>> = if let Some(ref sprue) = jewelry_model.sprue {
-                        vec![jewelry_model.base.clone(), sprue.clone()]
-                    } else {
-                        vec![jewelry_model.base.clone()]
-                    };
-                    let mut id_texture = Texture2D::new_empty::<u8>(
-                        &context,
-                        frame_input.viewport.width,
-                        frame_input.viewport.height,
-                        Interpolation::Nearest,
-                        Interpolation::Nearest,
-                        None,
-                        Wrapping::ClampToEdge,
-                        Wrapping::ClampToEdge,
-                    );
-                    let mut render_target = RenderTarget::new(
-                        ColorTarget::new_texture_2d(&context, &mut id_texture),
-                        DepthTarget::new(&context, frame_input.viewport.width, frame_input.viewport.height),
-                    );
-                    render_target.clear(ClearState::color_and_depth(0.0, 0.0, 0.0, 1.0, 1.0));
-                    for (i, obj) in objects.iter().enumerate() {
-                        let id_material = PhysicalMaterial::new_opaque(
-                            &context,
-                            &CpuMaterial {
-                                albedo: Srgba::new_opaque((i + 1) as u8, 0, 0), // ID in red channel
-                                ..Default::default()
-                            },
-                        );
-                        render_target.render(&camera, &[Gm::new(obj.geometry.clone(), id_material)], &[]);
-                    }
-                    let x = (position.x as f32).clamp(0.0, frame_input.viewport.width as f32 - 1.0) as u32;
-                    let y = (position.y as f32).clamp(0.0, frame_input.viewport.height as f32 - 1.0) as u32;
-                    // Read pixel from texture (simplified, requires OpenGL access)
-                    let mut pixel = vec![0u8; 4];
-                    unsafe {
-                        id_texture.bind();
-                        gl::ReadPixels(x as i32, y as i32, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, pixel.as_mut_ptr() as *mut _);
-                    }
-                    if pixel[0] > 0 {
-                        let id = pixel[0] as u32 - 1; // Adjust for 0-based indexing
-                        jewelry_model.selected = Some(id);
-                        let pos = if id == 0 {
-                            vec3(0.0, 2.0, 0.0)
-                        } else {
-                            vec3(0.0, attachment_y, 0.0) + sprue_offset
-                        };
-                        gizmo_transform.translation = DVec3::new(pos.x as f64, pos.y as f64, pos.z as f64).into();
-                        redraw = true;
-                    }
-                }
-            }
-        }
 
         gui.update(
             &mut frame_input.events,
@@ -156,24 +102,37 @@ pub async fn run() {
                     ui.collapsing("Sprue Settings", |ui| {
                         if ui.button("Generate Sprue").clicked() {
                             generate_sprue = true;
+                            println!("Generate Sprue clicked"); // Debug
                         }
-                        if ui.add(egui::Slider::new(&mut sprue_radius, 0.05..=0.5).text("Radius")).changed() {
+
+                        let radius_response = ui.add(egui::Slider::new(&mut sprue_radius, 0.05..=0.5).text("Radius"));
+                        let height_response = ui.add(egui::Slider::new(&mut sprue_height, 0.1..=2.0).text("Height"));
+                        let x_offset_response = ui.add(egui::Slider::new(&mut sprue_offset.x, -1.0..=1.0).text("X Offset"));
+                        let y_offset_response = ui.add(egui::Slider::new(&mut sprue_offset.y, 0.0..=1.0).text("Y Offset"));
+                        let z_offset_response = ui.add(egui::Slider::new(&mut sprue_offset.z, -1.0..=1.0).text("Z Offset"));
+
+                        if radius_response.drag_stopped() && radius_response.changed() {
                             sprue_changed = true;
+                            println!("Radius changed to {}", sprue_radius); // Debug
                         }
-                        if ui.add(egui::Slider::new(&mut sprue_height, 0.1..=2.0).text("Height")).changed() {
+                        if height_response.drag_stopped() && height_response.changed() {
                             sprue_changed = true;
+                            println!("Height changed to {}", sprue_height); // Debug
                         }
-                        if ui.add(egui::Slider::new(&mut sprue_offset.x, -1.0..=1.0).text("X Offset")).changed() {
+                        if x_offset_response.drag_stopped() && x_offset_response.changed() {
                             sprue_changed = true;
                             gizmo_transform.translation.x = sprue_offset.x as f64;
+                            println!("X Offset changed to {}", sprue_offset.x); // Debug
                         }
-                        if ui.add(egui::Slider::new(&mut sprue_offset.y, 0.0..=1.0).text("Y Offset")).changed() {
+                        if y_offset_response.drag_stopped() && y_offset_response.changed() {
                             sprue_changed = true;
                             gizmo_transform.translation.y = (attachment_y + sprue_offset.y) as f64;
+                            println!("Y Offset changed to {}", sprue_offset.y); // Debug
                         }
-                        if ui.add(egui::Slider::new(&mut sprue_offset.z, -1.0..=1.0).text("Z Offset")).changed() {
+                        if z_offset_response.drag_stopped() && z_offset_response.changed() {
                             sprue_changed = true;
                             gizmo_transform.translation.z = sprue_offset.z as f64;
+                            println!("Z Offset changed to {}", sprue_offset.z); // Debug
                         }
                     });
 
@@ -202,6 +161,7 @@ pub async fn run() {
                             ..Default::default()
                         });
 
+                        println!("Gizmo transform: {:?}", gizmo_transform.translation); // Debug
                         if let Some((_, new_transforms)) = gizmo.interact(ui, &[gizmo_transform]) {
                             for new_transform in new_transforms.iter() {
                                 gizmo_transform = *new_transform;
@@ -210,13 +170,14 @@ pub async fn run() {
                                     sprue_offset.y = (new_transform.translation.y as f32) - attachment_y;
                                     sprue_offset.z = new_transform.translation.z as f32;
                                     sprue_changed = true;
+                                    println!("Gizmo moved sprue to {:?}", sprue_offset); // Debug
                                 }
                                 gizmo_interacted = true;
                             }
                         }
                     }
 
-                    egui_consumes_input = ui.ctx().wants_pointer_input();
+                    egui_consumes_input = ui.ctx().wants_pointer_input() || ui.ctx().is_pointer_over_area();
                 });
 
                 egui::SidePanel::right("object_info_panel").show(gui_context, |ui| {
@@ -239,7 +200,6 @@ pub async fn run() {
                                 if ui.color_edit_button_rgb(&mut color).changed() {
                                     material.albedo = Srgba::new_opaque((color[0] * 255.0) as u8, (color[1] * 255.0) as u8, (color[2] * 255.0) as u8);
                                     jewelry_model.base.material = material;
-                                    redraw = true;
                                 }
                             } else if selected == 1 {
                                 if let Some(sprue) = jewelry_model.sprue.as_mut() {
@@ -248,7 +208,6 @@ pub async fn run() {
                                     if ui.color_edit_button_rgb(&mut color).changed() {
                                         material.albedo = Srgba::new_opaque((color[0] * 255.0) as u8, (color[1] * 255.0) as u8, (color[2] * 255.0) as u8);
                                         sprue.material = material;
-                                        redraw = true;
                                     }
                                 }
                             }
@@ -257,11 +216,138 @@ pub async fn run() {
                         }
                     });
                 });
+
+                // Get the gizmo world position from its transform.
+                let gizmo_world = vec3(
+                    gizmo_transform.translation.x as f32,
+                    gizmo_transform.translation.y as f32,
+                    gizmo_transform.translation.z as f32,
+                );
+
+                // Compute the view-projection matrix.
+                let view_proj = camera.projection() * camera.view();
+
+                // Project the world position to clip space.
+                let gizmo_clip = view_proj * vec4(gizmo_world.x, gizmo_world.y, gizmo_world.z, 1.0);
+                // Convert to normalized device coordinates (NDC).
+                let gizmo_ndc = vec2(gizmo_clip.x / gizmo_clip.w, gizmo_clip.y / gizmo_clip.w);
+
+                // Convert NDC (which is in [-1,1]) to screen coordinates.
+                let viewport = frame_input.viewport;
+                let gizmo_screen_x = ((gizmo_ndc.x + 1.0) / 2.0) * viewport.width as f32;
+                let gizmo_screen_y = ((1.0 - gizmo_ndc.y) / 2.0) * viewport.height as f32;
+
+
+                let gizmo_area_rect = egui::Rect::from_min_size(
+                    egui::pos2(gizmo_screen_x - 150.0, gizmo_screen_y - 150.0),
+                    egui::vec2(300.0, 300.0)
+                );
+                
+
+                
+                egui::Area::new("gizmo_area".into())
+                .order(egui::Order::Foreground)
+                .constrain_to(gizmo_area_rect)
+                .show(gui_context, |ui| {
+                    // Update gizmo configuration.
+                    let viewport = frame_input.viewport.to_egui();
+                    let view_matrix = camera.view().as_dmat4();
+                    let projection_matrix = camera.projection().as_dmat4();
+            
+                    gizmo.update_config(GizmoConfig {
+                        view_matrix: view_matrix.into(),
+                        projection_matrix: projection_matrix.into(),
+                        viewport,
+                        modes: gizmo_modes,
+                        orientation: gizmo_orientation,
+                        snapping: ui.input(|i| i.modifiers.ctrl),
+                        ..Default::default()
+                    });
+            
+                    if let Some((_, new_transforms)) = gizmo.interact(ui, &[gizmo_transform]) {
+                        for new_transform in new_transforms.iter() {
+                            gizmo_transform = *new_transform;
+                            if jewelry_model.selected == Some(1) {
+                                sprue_offset.x = new_transform.translation.x as f32;
+                                sprue_offset.y = (new_transform.translation.y as f32) - attachment_y;
+                                sprue_offset.z = new_transform.translation.z as f32;
+                                sprue_changed = true;
+                                println!("Gizmo moved sprue to {:?}", sprue_offset);
+                            }
+                        }
+                    }
+                });
+            
             },
         );
 
+        // Picking logic
+        for event in &frame_input.events {
+            if let Event::MousePress { button, position, .. } = event {
+                if *button == MouseButton::Left && !egui_consumes_input {
+                    let x = (2.0 * position.x as f32 / frame_input.viewport.width as f32) - 1.0;
+                    let y = 1.0 - (2.0 * position.y as f32 / frame_input.viewport.height as f32);
+                    let near_ndc = vec4(x, y, -1.0, 1.0);
+                    let far_ndc = vec4(x, y, 1.0, 1.0);
+
+                    let view_proj = camera.projection() * camera.view();
+                    let inv_vp = view_proj.invert().expect("Failed to invert view-projection matrix");
+                    let near_world = inv_vp * near_ndc;
+                    let far_world = inv_vp * far_ndc;
+                    let near = vec3(near_world.x / near_world.w, near_world.y / near_world.w, near_world.z / near_world.w);
+                    let far = vec3(far_world.x / far_world.w, far_world.y / far_world.w, far_world.z / far_world.w);
+                    let direction = (far - near).normalize();
+                    let ray = Ray { origin: near, direction };
+
+                    let mut closest = None;
+                    let mut min_dist = f32::INFINITY;
+
+                    if let Some(dist) = raycast_mesh(
+                        &jewelry_model.base_cpu_mesh,
+                        &ray,
+                        &Mat4::identity()
+                    ) {
+                        if dist < min_dist {
+                            min_dist = dist;
+                            closest = Some(0);
+                        }
+                        println!("Base hit at distance: {}", dist); // Debug
+                    }
+                    
+                    if let (Some(sprue), Some(sprue_cpu_mesh)) = (&jewelry_model.sprue, &jewelry_model.sprue_cpu_mesh) {
+                        if let Some(dist) = raycast_mesh(
+                            sprue_cpu_mesh,
+                            &ray,
+                            &Mat4::identity()
+                        ) {
+                            if dist < min_dist {
+                                min_dist = dist;
+                                closest = Some(1);
+                            }
+                            println!("Sprue hit at distance: {}", dist); // Debug
+                        }
+                    }
+                    
+                    
+                    if let Some(id) = closest {
+                        jewelry_model.selected = Some(id);
+                        let pos = if id == 0 {
+                            // Compute the center of the base mesh
+                            mesh_center(&jewelry_model.base_cpu_mesh)
+                        } else {
+                            // For the sprue, use your calculated attachment position.
+                            vec3(0.0, attachment_y, 0.0) + sprue_offset
+                        };
+                        gizmo_transform.translation = DVec3::new(pos.x as f64, pos.y as f64, pos.z as f64).into();
+                        println!("Selected object ID: {} at position {:?}", id, pos); // Debug
+                    }
+                    
+                }
+            }
+        }
+
         if !egui_consumes_input {
-            redraw |= control.handle_events(&mut camera, &mut frame_input.events);
+            control.handle_events(&mut camera, &mut frame_input.events);
         }
 
         if let Some(path) = file_path.take() {
@@ -274,13 +360,14 @@ pub async fn run() {
             pending_model = Some(new_model);
         }
 
-        if let Some((new_model, min_y)) = pending_model.take() {
+        if let Some((new_model, new_cpu_mesh, min_y)) = pending_model.take() {
             jewelry_model.base = new_model;
+            jewelry_model.base_cpu_mesh = new_cpu_mesh;
             jewelry_model.sprue = None;
+            jewelry_model.sprue_cpu_mesh = None;
             jewelry_model.selected = None;
             attachment_y = min_y;
             gizmo_transform.translation.y = (attachment_y + sprue_offset.y) as f64;
-            redraw = true;
         }
 
         if generate_sprue || (sprue_changed && jewelry_model.sprue.is_some()) {
@@ -288,6 +375,7 @@ pub async fn run() {
             sprue_mesh
                 .transform(Mat4::from_translation(vec3(0.0, attachment_y, 0.0) + sprue_offset))
                 .unwrap();
+            let sprue_cpu_mesh = sprue_mesh.clone();
             jewelry_model.sprue = Some(Gm::new(
                 Mesh::new(&context, &sprue_mesh),
                 PhysicalMaterial::new_opaque(
@@ -300,33 +388,42 @@ pub async fn run() {
                     },
                 ),
             ));
+            jewelry_model.sprue_cpu_mesh = Some(sprue_cpu_mesh);
             jewelry_model.selected = Some(1);
             gizmo_transform.translation = DVec3::new(sprue_offset.x as f64, (attachment_y + sprue_offset.y) as f64, sprue_offset.z as f64).into();
             generate_sprue = false;
             sprue_changed = false;
-            redraw = true;
+            println!("Sprue generated at {:?}", sprue_offset); // Debug
         }
 
-        redraw |= gizmo_interacted;
+        // Render every frame
+        let screen = frame_input.screen();
+        screen.clear(ClearState::color_and_depth(12.0 / 255.0, 12.0 / 255.0, 16.0 / 255.0, 1.0, 1.0));
+        let objects: Vec<&dyn Object> = if let Some(ref sprue) = jewelry_model.sprue {
+            vec![&jewelry_model.base, sprue]
+        } else {
+            vec![&jewelry_model.base]
+        };
+        screen.render(&camera, &objects, &[&ambient, &directional]);
 
-        if redraw {
-            let mut screen = frame_input.screen();
-            screen.clear(ClearState::color_and_depth(12.0 / 255.0, 12.0 / 255.0, 16.0 / 255.0, 1.0, 1.0));
-            let objects: Vec<&dyn Object> = if let Some(ref sprue) = jewelry_model.sprue {
-                vec![&jewelry_model.base, sprue]
-            } else {
+        if let Some(selected) = jewelry_model.selected {
+            let highlight_objects: Vec<&dyn Object> = if selected == 0 {
                 vec![&jewelry_model.base]
+            } else if selected == 1 && jewelry_model.sprue.is_some() {
+                vec![jewelry_model.sprue.as_ref().unwrap()]
+            } else {
+                vec![]
             };
-            screen.render(&camera, &objects, &[&ambient, &directional]);
-            let base_highlight = jewelry_model.selected == Some(0);
-            let sprue_highlight = jewelry_model.selected == Some(1);
-            if base_highlight {
-                screen.render(&camera, &[&jewelry_model.base], &[&AmbientLight::new(&context, 0.3, Srgba::new_opaque(255, 255, 0))]);
-            } else if sprue_highlight && jewelry_model.sprue.is_some() {
-                screen.render(&camera, &[jewelry_model.sprue.as_ref().unwrap()], &[&AmbientLight::new(&context, 0.3, Srgba::new_opaque(255, 255, 0))]);
+            if !highlight_objects.is_empty() {
+                screen.render(
+                    &camera,
+                    &highlight_objects,
+                    &[&AmbientLight::new(&context, 0.5, Srgba::new_opaque(255, 255, 0))],
+                );
             }
-            screen.write(|| gui.render());
         }
+
+        screen.write(|| gui.render());
 
         FrameOutput {
             swap_buffers: redraw,
@@ -337,11 +434,13 @@ pub async fn run() {
 
 struct JewelryModel {
     base: Gm<Mesh, PhysicalMaterial>,
+    base_cpu_mesh: CpuMesh,
     sprue: Option<Gm<Mesh, PhysicalMaterial>>,
+    sprue_cpu_mesh: Option<CpuMesh>,
     selected: Option<u32>,
 }
 
-async fn load_model(context: &Context, path: &str) -> (Gm<Mesh, PhysicalMaterial>, f32) {
+async fn load_model(context: &Context, path: &str) -> (Gm<Mesh, PhysicalMaterial>, CpuMesh, f32) {
     let mut loaded = three_d_asset::io::load_async(&[path])
         .await
         .expect("Failed to load OBJ file");
@@ -371,7 +470,7 @@ async fn load_model(context: &Context, path: &str) -> (Gm<Mesh, PhysicalMaterial
             },
         ),
     );
-    (model, min_y)
+    (model, cpu_mesh, min_y)
 }
 
 fn create_cylinder(sides: u32, radius: f32, height: f32) -> CpuMesh {
@@ -426,6 +525,74 @@ fn create_cylinder(sides: u32, radius: f32, height: f32) -> CpuMesh {
     }
 }
 
+struct Ray {
+    origin: Vec3,
+    direction: Vec3,
+}
+
+fn raycast_mesh(cpu_mesh: &CpuMesh, ray: &Ray, model_matrix: &Mat4) -> Option<f32> {
+    let positions = match &cpu_mesh.positions {
+        Positions::F32(pos) => pos,
+        _ => return None,
+    };
+    let indices = match &cpu_mesh.indices {
+        Indices::U32(ind) => ind,
+        _ => return None,
+    };
+
+    let mut min_dist = f32::INFINITY;
+    let mut hit = false;
+
+    for i in (0..indices.len()).step_by(3) {
+        let v0 = model_matrix * vec4(positions[indices[i] as usize].x, positions[indices[i] as usize].y, positions[indices[i] as usize].z, 1.0);
+        let v1 = model_matrix * vec4(positions[indices[i + 1] as usize].x, positions[indices[i + 1] as usize].y, positions[indices[i + 1] as usize].z, 1.0);
+        let v2 = model_matrix * vec4(positions[indices[i + 2] as usize].x, positions[indices[i + 2] as usize].y, positions[indices[i + 2] as usize].z, 1.0);
+
+        if let Some(dist) = ray_triangle_intersection(ray, vec3(v0.x, v0.y, v0.z), vec3(v1.x, v1.y, v1.z), vec3(v2.x, v2.y, v2.z)) {
+            if dist < min_dist {
+                min_dist = dist;
+                hit = true;
+            }
+        }
+    }
+
+    if hit { Some(min_dist) } else { None }
+}
+
+fn ray_triangle_intersection(ray: &Ray, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<f32> {
+    const EPSILON: f32 = 0.000001;
+    let edge1 = v1 - v0;
+    let edge2 = v2 - v0;
+    let h = ray.direction.cross(edge2);
+    let a = edge1.dot(h);
+
+    if a > -EPSILON && a < EPSILON {
+        return None;
+    }
+
+    let f = 1.0 / a;
+    let s = ray.origin - v0;
+    let u = f * s.dot(h);
+
+    if u < 0.0 || u > 1.0 {
+        return None;
+    }
+
+    let q = s.cross(edge1);
+    let v = f * ray.direction.dot(q);
+
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+
+    let t = f * edge2.dot(q);
+    if t > EPSILON {
+        Some(t)
+    } else {
+        None
+    }
+}
+
 trait ToEguiRect {
     fn to_egui(self) -> egui::Rect;
 }
@@ -451,5 +618,21 @@ impl AsDMat4 for Mat4 {
             self.z.x as f64, self.z.y as f64, self.z.z as f64, self.z.w as f64,
             self.w.x as f64, self.w.y as f64, self.w.z as f64, self.w.w as f64,
         ])
+    }
+}
+
+
+fn mesh_center(cpu_mesh: &CpuMesh) -> Vec3 {
+    match &cpu_mesh.positions {
+        Positions::F32(positions) => {
+            let mut min = positions[0];
+            let mut max = positions[0];
+            for pos in positions {
+                min = vec3(min.x.min(pos.x), min.y.min(pos.y), min.z.min(pos.z));
+                max = vec3(max.x.max(pos.x), max.y.max(pos.y), max.z.max(pos.z));
+            }
+            (min + max) / 2.0
+        }
+        _ => vec3(0.0, 0.0, 0.0),
     }
 }
