@@ -11,6 +11,25 @@ async fn main() {
     run().await;
 }
 
+// NEW: define an enum to identify objects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ObjectId {
+    Base,
+    Sprue(usize),
+}
+
+// NEW: update JewelryModel to store transforms
+// #[derive(Debug)]
+struct JewelryModel {
+    base: Gm<Mesh, PhysicalMaterial>,
+    base_cpu_mesh: CpuMesh,
+    base_transform: Transform,          // NEW: store base transform
+    sprues: Vec<Gm<Mesh, PhysicalMaterial>>,
+    sprues_cpu_mesh: Vec<CpuMesh>,
+    sprues_transforms: Vec<Transform>,  // NEW: store transforms for each sprue
+    selected: Option<ObjectId>,
+}
+
 pub async fn run() {
     let window = Window::new(WindowSettings {
         title: "Jewelry Sprue Tool".to_string(),
@@ -36,11 +55,19 @@ pub async fn run() {
     let mut control = OrbitControl::new(camera.target(), 0.1 * scene_radius, 1000.0 * scene_radius);
 
     let (initial_model, initial_cpu_mesh, min_y) = load_model(&context, "assets/suzanne.obj").await;
+    let center = mesh_center(&initial_cpu_mesh);
+    let base_transform = Transform::from_scale_rotation_translation(
+          DVec3::ONE,
+          DQuat::IDENTITY,
+          DVec3::new(center.x as f64, center.y as f64, center.z as f64)
+    );
     let mut jewelry_model = JewelryModel {
         base: initial_model,
         base_cpu_mesh: initial_cpu_mesh,
-        sprue: None,
-        sprue_cpu_mesh: None,
+        base_transform: base_transform.clone(),  // store initial transform
+        sprues: Vec::new(),
+        sprues_cpu_mesh: Vec::new(),
+        sprues_transforms: Vec::new(), // initially no sprues
         selected: None,
     };
 
@@ -51,29 +78,21 @@ pub async fn run() {
     let mut generate_sprue = false;
     let mut pending_model: Option<(Gm<Mesh, PhysicalMaterial>, CpuMesh, f32)> = None;
     let mut attachment_y = min_y;
-
     let mut sprue_radius = 0.1;
-    let mut sprue_height = 1.0;
-    let mut sprue_offset = vec3(0.0, 0.5, 0.0);
+    let mut sprue_height  = 1.0;
+    let mut sprue_offset  = vec3(0.0, 0.5, 0.0);
     let mut sprue_changed = false;
 
     let mut gizmo = Gizmo::default();
     let gizmo_modes = GizmoMode::all();
     let mut gizmo_orientation = GizmoOrientation::Local;
-    let mut gizmo_transform = Transform::from_scale_rotation_translation(
-        DVec3::ONE,
-        DQuat::IDENTITY,
-        DVec3::new(sprue_offset.x as f64, (attachment_y + sprue_offset.y) as f64, sprue_offset.z as f64),
-    );
+    // Initialize gizmo_transform to the base model’s center.
+    let mut gizmo_transform = base_transform.clone();
 
     window.render_loop(move |mut frame_input| {
-        let redraw = true; // Always redraw for UI responsiveness
-
+        let redraw = true;
         camera.set_viewport(frame_input.viewport);
-
         let mut egui_consumes_input = false;
-        let mut gizmo_interacted = false;
-
         gui.update(
             &mut frame_input.events,
             frame_input.accumulated_time,
@@ -104,35 +123,32 @@ pub async fn run() {
                             generate_sprue = true;
                             println!("Generate Sprue clicked"); // Debug
                         }
-
+                        // Remove drag_stopped() to update continuously (already done).
                         let radius_response = ui.add(egui::Slider::new(&mut sprue_radius, 0.05..=0.5).text("Radius"));
                         let height_response = ui.add(egui::Slider::new(&mut sprue_height, 0.1..=2.0).text("Height"));
                         let x_offset_response = ui.add(egui::Slider::new(&mut sprue_offset.x, -1.0..=1.0).text("X Offset"));
                         let y_offset_response = ui.add(egui::Slider::new(&mut sprue_offset.y, 0.0..=1.0).text("Y Offset"));
                         let z_offset_response = ui.add(egui::Slider::new(&mut sprue_offset.z, -1.0..=1.0).text("Z Offset"));
-
-                        if radius_response.drag_stopped() && radius_response.changed() {
+                        if radius_response.changed() {
                             sprue_changed = true;
-                            println!("Radius changed to {}", sprue_radius); // Debug
+                            println!("Radius changed to {}", sprue_radius);
                         }
-                        if height_response.drag_stopped() && height_response.changed() {
+                        if height_response.changed() {
                             sprue_changed = true;
-                            println!("Height changed to {}", sprue_height); // Debug
+                            println!("Height changed to {}", sprue_height);
                         }
-                        if x_offset_response.drag_stopped() && x_offset_response.changed() {
+                        if x_offset_response.changed() {
                             sprue_changed = true;
+                            // Update gizmo translation.x accordingly
                             gizmo_transform.translation.x = sprue_offset.x as f64;
-                            println!("X Offset changed to {}", sprue_offset.x); // Debug
                         }
-                        if y_offset_response.drag_stopped() && y_offset_response.changed() {
+                        if y_offset_response.changed() {
                             sprue_changed = true;
                             gizmo_transform.translation.y = (attachment_y + sprue_offset.y) as f64;
-                            println!("Y Offset changed to {}", sprue_offset.y); // Debug
                         }
-                        if z_offset_response.drag_stopped() && z_offset_response.changed() {
+                        if z_offset_response.changed() {
                             sprue_changed = true;
                             gizmo_transform.translation.z = sprue_offset.z as f64;
-                            println!("Z Offset changed to {}", sprue_offset.z); // Debug
                         }
                     });
 
@@ -146,11 +162,10 @@ pub async fn run() {
                             });
                     });
 
-                    if jewelry_model.selected.is_some() {
+                    if let Some(selected) = jewelry_model.selected {
                         let viewport = frame_input.viewport.to_egui();
                         let view_matrix = camera.view().as_dmat4();
                         let projection_matrix = camera.projection().as_dmat4();
-
                         gizmo.update_config(GizmoConfig {
                             view_matrix: view_matrix.into(),
                             projection_matrix: projection_matrix.into(),
@@ -160,19 +175,26 @@ pub async fn run() {
                             snapping: ui.input(|i| i.modifiers.ctrl),
                             ..Default::default()
                         });
-
-                        println!("Gizmo transform: {:?}", gizmo_transform.translation); // Debug
+                        // Update FULL transform (translation, rotation & scale) from gizmo interaction.
                         if let Some((_, new_transforms)) = gizmo.interact(ui, &[gizmo_transform]) {
                             for new_transform in new_transforms.iter() {
-                                gizmo_transform = *new_transform;
-                                if jewelry_model.selected == Some(1) {
-                                    sprue_offset.x = new_transform.translation.x as f32;
-                                    sprue_offset.y = (new_transform.translation.y as f32) - attachment_y;
-                                    sprue_offset.z = new_transform.translation.z as f32;
-                                    sprue_changed = true;
-                                    println!("Gizmo moved sprue to {:?}", sprue_offset); // Debug
+                                gizmo_transform = new_transform.clone();
+                                match selected {
+                                    ObjectId::Base => {
+                                        jewelry_model.base_transform = new_transform.clone();
+                                        println!("Gizmo updated BASE: {:?}", new_transform);
+                                        // Here you must update the base object’s model matrix in your rendering code.
+                                    }
+                                    ObjectId::Sprue(i) => {
+                                        if let Some(existing) = jewelry_model.sprues_transforms.get_mut(i) {
+                                            *existing = new_transform.clone();
+                                        } else {
+                                            // Should not happen
+                                        }
+                                        println!("Gizmo updated SPRUE {}: {:?}", i, new_transform);
+                                        // Update the sprue object's transformation accordingly.
+                                    }
                                 }
-                                gizmo_interacted = true;
                             }
                         }
                     }
@@ -180,203 +202,181 @@ pub async fn run() {
                     egui_consumes_input = ui.ctx().wants_pointer_input() || ui.ctx().is_pointer_over_area();
                 });
 
-                egui::SidePanel::right("object_info_panel").show(gui_context, |ui| {
-                    ui.heading("Objects");
+                egui::SidePanel::right("object_info_panel")
+                    .show(gui_context, |ui| {
+                        ui.heading("Objects");
 
-                    ui.label("Objects in Scene:");
-                    ui.group(|ui| {
-                        ui.label(format!("Base (ID: 0) {}", if jewelry_model.selected == Some(0) { "[Selected]" } else { "" }));
-                        if jewelry_model.sprue.is_some() {
-                            ui.label(format!("Sprue (ID: 1) {}", if jewelry_model.selected == Some(1) { "[Selected]" } else { "" }));
-                        }
-                    });
+                        ui.label("Objects in Scene:");
+                        ui.group(|ui| {
+                            ui.label(format!("Base (ID: 0) {}", if jewelry_model.selected == Some(ObjectId::Base) { "[Selected]" } else { "" }));
+                            for (i, sprue) in jewelry_model.sprues.iter().enumerate() {
+                                ui.label(format!("Sprue (ID: {}) {}", i, if jewelry_model.selected == Some(ObjectId::Sprue(i)) { "[Selected]" } else { "" }));
+                            }
+                        });
 
-                    ui.label("Object Properties:");
-                    ui.group(|ui| {
-                        if let Some(selected) = jewelry_model.selected {
-                            if selected == 0 {
-                                let mut material = jewelry_model.base.material.clone();
-                                let mut color = [material.albedo.r as f32 / 255.0, material.albedo.g as f32 / 255.0, material.albedo.b as f32 / 255.0];
-                                if ui.color_edit_button_rgb(&mut color).changed() {
-                                    material.albedo = Srgba::new_opaque((color[0] * 255.0) as u8, (color[1] * 255.0) as u8, (color[2] * 255.0) as u8);
-                                    jewelry_model.base.material = material;
-                                }
-                            } else if selected == 1 {
-                                if let Some(sprue) = jewelry_model.sprue.as_mut() {
-                                    let mut material = sprue.material.clone();
-                                    let mut color = [material.albedo.r as f32 / 255.0, material.albedo.g as f32 / 255.0, material.albedo.b as f32 / 255.0];
-                                    if ui.color_edit_button_rgb(&mut color).changed() {
-                                        material.albedo = Srgba::new_opaque((color[0] * 255.0) as u8, (color[1] * 255.0) as u8, (color[2] * 255.0) as u8);
-                                        sprue.material = material;
+                        ui.label("Object Properties:");
+                        ui.group(|ui| {
+                            if let Some(selected) = jewelry_model.selected {
+                                match selected {
+                                    ObjectId::Base => {
+                                        // Allow editing base model material color.
+                                        let mut material = jewelry_model.base.material.clone();
+                                        let mut color = [material.albedo.r as f32/255.0, material.albedo.g as f32/255.0, material.albedo.b as f32/255.0];
+                                        if ui.color_edit_button_rgb(&mut color).changed() {
+                                            material.albedo = Srgba::new_opaque((color[0]*255.0) as u8,(color[1]*255.0) as u8,(color[2]*255.0) as u8);
+                                            jewelry_model.base.material = material;
+                                        }
+                                    }
+                                    ObjectId::Sprue(i) => {
+                                        if let Some(sprue) = jewelry_model.sprues.get_mut(i) {
+                                            let mut material = sprue.material.clone();
+                                            let mut color = [material.albedo.r as f32/255.0, material.albedo.g as f32/255.0, material.albedo.b as f32/255.0];
+                                            if ui.color_edit_button_rgb(&mut color).changed() {
+                                                material.albedo = Srgba::new_opaque((color[0]*255.0) as u8,(color[1]*255.0) as u8,(color[2]*255.0) as u8);
+                                                sprue.material = material;
+                                            }
+                                        }
                                     }
                                 }
+                            } else {
+                                ui.label("No object selected.");
                             }
-                        } else {
-                            ui.label("No object selected.");
-                        }
+                        });
                     });
-                });
 
-                // Get the gizmo world position from its transform.
+                // Overlay area for gizmo (positioned via projecting the gizmo’s world coordinates)
                 let gizmo_world = vec3(
                     gizmo_transform.translation.x as f32,
                     gizmo_transform.translation.y as f32,
                     gizmo_transform.translation.z as f32,
                 );
-
-                // Compute the view-projection matrix.
                 let view_proj = camera.projection() * camera.view();
-
-                // Project the world position to clip space.
                 let gizmo_clip = view_proj * vec4(gizmo_world.x, gizmo_world.y, gizmo_world.z, 1.0);
-                // Convert to normalized device coordinates (NDC).
                 let gizmo_ndc = vec2(gizmo_clip.x / gizmo_clip.w, gizmo_clip.y / gizmo_clip.w);
-
-                // Convert NDC (which is in [-1,1]) to screen coordinates.
-                let viewport = frame_input.viewport;
-                let gizmo_screen_x = ((gizmo_ndc.x + 1.0) / 2.0) * viewport.width as f32;
-                let gizmo_screen_y = ((1.0 - gizmo_ndc.y) / 2.0) * viewport.height as f32;
-
-
+                let vp = frame_input.viewport;
+                let gizmo_screen_x = ((gizmo_ndc.x + 1.0) / 2.0) * vp.width as f32;
+                let gizmo_screen_y = ((1.0 - gizmo_ndc.y) / 2.0) * vp.height as f32;
                 let gizmo_area_rect = egui::Rect::from_min_size(
-                    egui::pos2(gizmo_screen_x - 150.0, gizmo_screen_y - 150.0),
-                    egui::vec2(300.0, 300.0)
-                );
-                
-
-                
+                                          egui::pos2(gizmo_screen_x - 150.0, gizmo_screen_y - 150.0),
+                                          egui::vec2(300.0, 300.0)
+                                      );
                 egui::Area::new("gizmo_area".into())
-                .order(egui::Order::Foreground)
-                .constrain_to(gizmo_area_rect)
-                .show(gui_context, |ui| {
-                    // Update gizmo configuration.
-                    let viewport = frame_input.viewport.to_egui();
-                    let view_matrix = camera.view().as_dmat4();
-                    let projection_matrix = camera.projection().as_dmat4();
-            
-                    gizmo.update_config(GizmoConfig {
-                        view_matrix: view_matrix.into(),
-                        projection_matrix: projection_matrix.into(),
-                        viewport,
-                        modes: gizmo_modes,
-                        orientation: gizmo_orientation,
-                        snapping: ui.input(|i| i.modifiers.ctrl),
-                        ..Default::default()
-                    });
-            
-                    if let Some((_, new_transforms)) = gizmo.interact(ui, &[gizmo_transform]) {
-                        for new_transform in new_transforms.iter() {
-                            gizmo_transform = *new_transform;
-                            if jewelry_model.selected == Some(1) {
-                                sprue_offset.x = new_transform.translation.x as f32;
-                                sprue_offset.y = (new_transform.translation.y as f32) - attachment_y;
-                                sprue_offset.z = new_transform.translation.z as f32;
-                                sprue_changed = true;
-                                println!("Gizmo moved sprue to {:?}", sprue_offset);
-                            }
-                        }
-                    }
-                });
-            
+                  .order(egui::Order::Foreground)
+                  .constrain_to(gizmo_area_rect)
+                  .show(gui_context, |ui| {
+                      let vp = frame_input.viewport.to_egui();
+                      let view_matrix = camera.view().as_dmat4();
+                      let projection_matrix = camera.projection().as_dmat4();
+                      gizmo.update_config(GizmoConfig {
+                          view_matrix: view_matrix.into(),
+                          projection_matrix: projection_matrix.into(),
+                          viewport: vp,
+                          modes: gizmo_modes,
+                          orientation: gizmo_orientation,
+                          snapping: ui.input(|i| i.modifiers.ctrl),
+                          ..Default::default()
+                      });
+                      if let Some((_, new_transforms)) = gizmo.interact(ui, &[gizmo_transform]) {
+                          for new_transform in new_transforms.iter() {
+                              gizmo_transform = new_transform.clone();
+                              match jewelry_model.selected {
+                                  Some(ObjectId::Sprue(i)) => {
+                                      // For simplicity, update the sprue's transform by re-generating its mesh with new translation.
+                                      sprue_offset.x = new_transform.translation.x as f32;
+                                      sprue_offset.y = (new_transform.translation.y as f32) - attachment_y;
+                                      sprue_offset.z = new_transform.translation.z as f32;
+                                      sprue_changed = true;
+                                      println!("Overlay gizmo updated sprue {}: {:?}", i, new_transform.translation);
+                                  }
+                                  Some(ObjectId::Base) => {
+                                      println!("Overlay gizmo updated base: {:?}", new_transform.translation);
+                                  }
+                                  None => {}
+                              }
+                          }
+                      }
+                  });
             },
         );
-
-        // Picking logic
+        // Picking logic:
         for event in &frame_input.events {
             if let Event::MousePress { button, position, .. } = event {
                 if *button == MouseButton::Left && !egui_consumes_input {
                     let x = (2.0 * position.x as f32 / frame_input.viewport.width as f32) - 1.0;
                     let y = 1.0 - (2.0 * position.y as f32 / frame_input.viewport.height as f32);
                     let near_ndc = vec4(x, y, -1.0, 1.0);
-                    let far_ndc = vec4(x, y, 1.0, 1.0);
-
+                    let far_ndc  = vec4(x, y, 1.0, 1.0);
                     let view_proj = camera.projection() * camera.view();
-                    let inv_vp = view_proj.invert().expect("Failed to invert view-projection matrix");
+                    let inv_vp = view_proj.invert().expect("Failed to invert VP matrix");
                     let near_world = inv_vp * near_ndc;
-                    let far_world = inv_vp * far_ndc;
-                    let near = vec3(near_world.x / near_world.w, near_world.y / near_world.w, near_world.z / near_world.w);
-                    let far = vec3(far_world.x / far_world.w, far_world.y / far_world.w, far_world.z / far_world.w);
-                    let direction = (far - near).normalize();
-                    let ray = Ray { origin: near, direction };
-
-                    let mut closest = None;
-                    let mut min_dist = f32::INFINITY;
-
-                    if let Some(dist) = raycast_mesh(
-                        &jewelry_model.base_cpu_mesh,
-                        &ray,
-                        &Mat4::identity()
-                    ) {
-                        if dist < min_dist {
-                            min_dist = dist;
-                            closest = Some(0);
-                        }
-                        println!("Base hit at distance: {}", dist); // Debug
+                    let far_world  = inv_vp * far_ndc;
+                    let near = vec3(near_world.x/near_world.w, near_world.y/near_world.w, near_world.z/near_world.w);
+                    let far  = vec3(far_world.x/far_world.w, far_world.y/far_world.w, far_world.z/far_world.w);
+                    let ray = Ray { origin: near, direction: (far - near).normalize() };
+                    let mut closest = (ObjectId::Base, f32::INFINITY);
+                    if let Some(dist) = raycast_mesh(&jewelry_model.base_cpu_mesh, &ray, &Mat4::identity()) {
+                        closest.1 = dist;
                     }
-                    
-                    if let (Some(sprue), Some(sprue_cpu_mesh)) = (&jewelry_model.sprue, &jewelry_model.sprue_cpu_mesh) {
-                        if let Some(dist) = raycast_mesh(
-                            sprue_cpu_mesh,
-                            &ray,
-                            &Mat4::identity()
-                        ) {
-                            if dist < min_dist {
-                                min_dist = dist;
-                                closest = Some(1);
+                    // Iterate over every sprue:
+                    for (i, cpu_mesh) in jewelry_model.sprues_cpu_mesh.iter().enumerate() {
+                        if let Some(dist) = raycast_mesh(cpu_mesh, &ray, &Mat4::identity()) {
+                            if dist < closest.1 {
+                                closest = (ObjectId::Sprue(i), dist);
                             }
-                            println!("Sprue hit at distance: {}", dist); // Debug
                         }
                     }
-                    
-                    
-                    if let Some(id) = closest {
-                        jewelry_model.selected = Some(id);
-                        let pos = if id == 0 {
-                            // Compute the center of the base mesh
-                            mesh_center(&jewelry_model.base_cpu_mesh)
-                        } else {
-                            // For the sprue, use your calculated attachment position.
-                            vec3(0.0, attachment_y, 0.0) + sprue_offset
-                        };
-                        gizmo_transform.translation = DVec3::new(pos.x as f64, pos.y as f64, pos.z as f64).into();
-                        println!("Selected object ID: {} at position {:?}", id, pos); // Debug
-                    }
-                    
+                    jewelry_model.selected = Some(closest.0);
+                    // Update gizmo_transform based on the picked object.
+                    let pos = match &jewelry_model.selected {
+                        Some(ObjectId::Base) => {
+                            // use the stored base_transform's translation
+                            let t = jewelry_model.base_transform.translation;
+                            vec3(t.x as f32, t.y as f32, t.z as f32)
+                        }
+                        Some(ObjectId::Sprue(i)) => {
+                            // use the stored sprue transform if available
+                            if let Some(trans) = jewelry_model.sprues_transforms.get(*i) {
+                                let t = trans.translation;
+                                vec3(t.x as f32, t.y as f32, t.z as f32)
+                            } else {
+                                vec3(0.0, attachment_y, 0.0) + sprue_offset
+                            }
+                        },
+                        _ => vec3(0.0,0.0,0.0)
+                    };
+                    // Update gizmo_transform to the stored transform.
+                    gizmo_transform.translation = DVec3::new(pos.x as f64, pos.y as f64, pos.z as f64).into();
+                    println!("Picked object {:?} at {:?}", jewelry_model.selected, pos);
                 }
             }
         }
-
-        if !egui_consumes_input {
-            control.handle_events(&mut camera, &mut frame_input.events);
-        }
-
+        if !egui_consumes_input { control.handle_events(&mut camera, &mut frame_input.events); }
         if let Some(path) = file_path.take() {
             let context = context.clone();
             let new_model = std::thread::spawn(move || {
                 tokio::runtime::Handle::current().block_on(load_model(&context, &path))
-            })
-            .join()
-            .unwrap();
+            }).join().unwrap();
             pending_model = Some(new_model);
         }
-
         if let Some((new_model, new_cpu_mesh, min_y)) = pending_model.take() {
             jewelry_model.base = new_model;
             jewelry_model.base_cpu_mesh = new_cpu_mesh;
-            jewelry_model.sprue = None;
-            jewelry_model.sprue_cpu_mesh = None;
+            jewelry_model.sprues.clear();
+            jewelry_model.sprues_cpu_mesh.clear();
             jewelry_model.selected = None;
             attachment_y = min_y;
-            gizmo_transform.translation.y = (attachment_y + sprue_offset.y) as f64;
+            let center = mesh_center(&jewelry_model.base_cpu_mesh);
+            gizmo_transform.translation = DVec3::new(center.x as f64, center.y as f64, center.z as f64).into();
         }
-
-        if generate_sprue || (sprue_changed && jewelry_model.sprue.is_some()) {
+        // In the generate sprue block, create a new sprue and record its transform.
+        if generate_sprue {
             let mut sprue_mesh = create_cylinder(10, sprue_radius, sprue_height);
+            // Apply a translation based on attachment_y and sprue_offset:
             sprue_mesh
                 .transform(Mat4::from_translation(vec3(0.0, attachment_y, 0.0) + sprue_offset))
                 .unwrap();
             let sprue_cpu_mesh = sprue_mesh.clone();
-            jewelry_model.sprue = Some(Gm::new(
+            let sprue_obj = Gm::new(
                 Mesh::new(&context, &sprue_mesh),
                 PhysicalMaterial::new_opaque(
                     &context,
@@ -385,32 +385,45 @@ pub async fn run() {
                         roughness: 0.7,
                         metallic: 0.8,
                         ..Default::default()
-                    },
-                ),
-            ));
-            jewelry_model.sprue_cpu_mesh = Some(sprue_cpu_mesh);
-            jewelry_model.selected = Some(1);
-            gizmo_transform.translation = DVec3::new(sprue_offset.x as f64, (attachment_y + sprue_offset.y) as f64, sprue_offset.z as f64).into();
+                    }
+                )
+            );
+            jewelry_model.sprues.push(sprue_obj);
+            jewelry_model.sprues_cpu_mesh.push(sprue_cpu_mesh);
+            // Record the new sprue’s transform (use current gizmo_transform)
+            jewelry_model.sprues_transforms.push(gizmo_transform.clone());
+            jewelry_model.selected = Some(ObjectId::Sprue(jewelry_model.sprues.len()-1));
+            println!("Sprue generated with transform: {:?}", gizmo_transform);
             generate_sprue = false;
             sprue_changed = false;
-            println!("Sprue generated at {:?}", sprue_offset); // Debug
         }
 
         // Render every frame
         let screen = frame_input.screen();
         screen.clear(ClearState::color_and_depth(12.0 / 255.0, 12.0 / 255.0, 16.0 / 255.0, 1.0, 1.0));
-        let objects: Vec<&dyn Object> = if let Some(ref sprue) = jewelry_model.sprue {
-            vec![&jewelry_model.base, sprue]
+        // First, update the transformations with a separate mutable block:
+        {
+            jewelry_model.base.set_transformation(transform_to_mat4(&jewelry_model.base_transform));
+            for (i, sprue) in jewelry_model.sprues.iter_mut().enumerate() {
+                if let Some(t) = jewelry_model.sprues_transforms.get(i) {
+                    sprue.set_transformation(transform_to_mat4(t));
+                }
+                
+            }
+        }
+        // Then, build the objects vector (immutable borrow now):
+        let objects: Vec<&dyn Object> = if !jewelry_model.sprues.is_empty() {
+            vec![&jewelry_model.base, &jewelry_model.sprues[0]]
         } else {
             vec![&jewelry_model.base]
         };
         screen.render(&camera, &objects, &[&ambient, &directional]);
 
         if let Some(selected) = jewelry_model.selected {
-            let highlight_objects: Vec<&dyn Object> = if selected == 0 {
+            let highlight_objects: Vec<&dyn Object> = if selected == ObjectId::Base {
                 vec![&jewelry_model.base]
-            } else if selected == 1 && jewelry_model.sprue.is_some() {
-                vec![jewelry_model.sprue.as_ref().unwrap()]
+            } else if let ObjectId::Sprue(i) = selected {
+                vec![jewelry_model.sprues.get(i).unwrap()]
             } else {
                 vec![]
             };
@@ -430,14 +443,6 @@ pub async fn run() {
             ..Default::default()
         }
     });
-}
-
-struct JewelryModel {
-    base: Gm<Mesh, PhysicalMaterial>,
-    base_cpu_mesh: CpuMesh,
-    sprue: Option<Gm<Mesh, PhysicalMaterial>>,
-    sprue_cpu_mesh: Option<CpuMesh>,
-    selected: Option<u32>,
 }
 
 async fn load_model(context: &Context, path: &str) -> (Gm<Mesh, PhysicalMaterial>, CpuMesh, f32) {
@@ -635,4 +640,18 @@ fn mesh_center(cpu_mesh: &CpuMesh) -> Vec3 {
         }
         _ => vec3(0.0, 0.0, 0.0),
     }
+}
+
+fn transform_to_mat4(t: &Transform) -> Mat4 {
+    let translation = vec3(t.translation.x as f32, t.translation.y as f32, t.translation.z as f32);
+    let scale = vec3(t.scale.x as f32, t.scale.y as f32, t.scale.z as f32);
+    let rotation = Quat::new(
+        t.rotation.s as f32,
+        t.rotation.v.x as f32,
+        t.rotation.v.y as f32,
+        t.rotation.v.z as f32,
+    );
+    Mat4::from_translation(translation)
+        * Mat4::from(rotation)
+        * Mat4::from_nonuniform_scale(scale.x, scale.y, scale.z)
 }
